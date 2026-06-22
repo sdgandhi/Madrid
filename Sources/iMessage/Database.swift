@@ -161,7 +161,23 @@ public final class Database {
                         c.guid,
                         c.display_name,
                         c.service_name,
-                        MAX(m.date) as last_message_date
+                        MAX(m.date) as last_message_date,
+                        COUNT(CASE
+                            WHEN m.is_read = 0
+                             AND m.is_from_me = 0
+                             AND m.is_empty = 0
+                             AND m.is_system_message = 0
+                            THEN 1
+                        END) as unread_count,
+                        COUNT(CASE
+                            WHEN m.is_read = 0
+                             AND m.is_from_me = 0
+                             AND m.is_empty = 0
+                             AND m.is_system_message = 0
+                             AND m.has_unseen_mention != 0
+                            THEN 1
+                        END) as unread_mentions_count,
+                        c.properties
                     FROM chat c
                     LEFT JOIN chat_message_join cmj ON c.ROWID = cmj.chat_id
                     LEFT JOIN message m ON cmj.message_id = m.ROWID
@@ -181,6 +197,9 @@ public final class Database {
                 let displayName = sqlite3_column_text(statement, 1).map { String(cString: $0) }
                 let lastMessageDate = Date(
                     nanosecondsSinceReferenceDate: sqlite3_column_int64(statement, 3))
+                let unreadCount = Int(sqlite3_column_int64(statement, 4))
+                let unreadMentionsCount = Int(sqlite3_column_int64(statement, 5))
+                let isMuted = chatPropertiesAreMuted(statement, 6)
 
                 // Fetch participants for this chat
                 let participants = try fetchParticipants(for: chatId)
@@ -189,7 +208,10 @@ public final class Database {
                     id: chatId,
                     displayName: displayName,
                     participants: participants,
-                    lastMessageDate: lastMessageDate
+                    lastMessageDate: lastMessageDate,
+                    unreadCount: unreadCount,
+                    unreadMentionsCount: unreadMentionsCount,
+                    isMuted: isMuted
                 )
             }
         }
@@ -249,7 +271,8 @@ public final class Database {
                         m.date,
                         m.is_from_me,
                         h.id,
-                        m.service
+                        m.service,
+                        m.is_read
                     FROM message m
                     \(chatId != nil ? "JOIN chat_message_join cmj ON m.ROWID = cmj.message_id" : "")
                     \(chatId != nil ? "JOIN chat c ON cmj.chat_id = c.ROWID" : "")
@@ -288,6 +311,7 @@ public final class Database {
                 let date = Date(
                     nanosecondsSinceReferenceDate: sqlite3_column_int64(statement, 3))
                 let isFromMe = sqlite3_column_int(statement, 4) != 0
+                let isUnread = !isFromMe && sqlite3_column_int(statement, 7) == 0
 
                 let senderText = sqlite3_column_text(statement, 5)
                 let sender = senderText.map { Account.Handle(rawValue: String(cString: $0)) }
@@ -297,6 +321,7 @@ public final class Database {
                     text: text,
                     date: date,
                     isFromMe: isFromMe,
+                    isUnread: isUnread,
                     sender: sender
                 )
             }
@@ -390,6 +415,104 @@ public final class Database {
             sqlite3_exec(db, "ROLLBACK", nil, nil, nil)
             throw error
         }
+    }
+
+    private func chatPropertiesAreMuted(_ statement: OpaquePointer, _ column: Int32) -> Bool {
+        guard sqlite3_column_type(statement, column) != SQLITE_NULL,
+            let bytes = sqlite3_column_blob(statement, column)
+        else {
+            return false
+        }
+
+        let length = Int(sqlite3_column_bytes(statement, column))
+        guard length > 0 else { return false }
+
+        let data = Data(bytes: bytes, count: length)
+        guard let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) else {
+            return false
+        }
+        return plistContainsMutedFlag(plist)
+    }
+
+    private func plistContainsMutedFlag(_ value: Any) -> Bool {
+        if let dictionary = value as? [String: Any] {
+            for (key, child) in dictionary {
+                let normalized = key.lowercased()
+                if mutedBooleanKey(normalized), truthy(child) {
+                    return true
+                }
+                if notificationLevelKey(normalized), mutedNotificationValue(child) {
+                    return true
+                }
+                if plistContainsMutedFlag(child) {
+                    return true
+                }
+            }
+            return false
+        }
+
+        if let array = value as? [Any] {
+            return array.contains(where: plistContainsMutedFlag)
+        }
+
+        return false
+    }
+
+    private func mutedBooleanKey(_ key: String) -> Bool {
+        let compact = key.replacingOccurrences(of: "_", with: "")
+            .replacingOccurrences(of: "-", with: "")
+            .replacingOccurrences(of: " ", with: "")
+        return compact == "ismuted"
+            || compact == "muted"
+            || compact == "mute"
+            || compact == "hidealerts"
+            || compact == "hasalertsdisabled"
+            || compact == "alertsdisabled"
+            || compact == "donotdisturb"
+            || compact == "notificationsmuted"
+    }
+
+    private func notificationLevelKey(_ key: String) -> Bool {
+        let compact = key.replacingOccurrences(of: "_", with: "")
+            .replacingOccurrences(of: "-", with: "")
+            .replacingOccurrences(of: " ", with: "")
+        return compact == "notificationlevel"
+            || compact == "notifications"
+            || compact == "alertstyle"
+            || compact == "alertlevel"
+    }
+
+    private func mutedNotificationValue(_ value: Any) -> Bool {
+        if let string = value as? String {
+            let normalized = string.lowercased()
+            return normalized == "mute"
+                || normalized == "muted"
+                || normalized == "none"
+                || normalized == "off"
+                || normalized == "disabled"
+        }
+        if let number = value as? NSNumber {
+            return number.intValue == 0
+        }
+        return false
+    }
+
+    private func truthy(_ value: Any) -> Bool {
+        if let bool = value as? Bool {
+            return bool
+        }
+        if let number = value as? NSNumber {
+            return number.boolValue
+        }
+        if let string = value as? String {
+            let normalized = string.lowercased()
+            return normalized == "true"
+                || normalized == "yes"
+                || normalized == "1"
+                || normalized == "mute"
+                || normalized == "muted"
+        }
+        return false
     }
 }
 

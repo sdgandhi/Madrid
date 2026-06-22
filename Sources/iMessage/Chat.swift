@@ -5,6 +5,9 @@ public struct Chat: Identifiable, Hashable, Codable, Sendable {
     public let displayName: String?
     public let participants: [Account.Handle]
     public let lastMessageDate: Date?
+    public let unreadCount: Int
+    public let unreadMentionsCount: Int
+    public let isMuted: Bool
 }
 
 // MARK: - Comparable
